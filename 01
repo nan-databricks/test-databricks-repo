@@ -1,36 +1,86 @@
 import asyncio
 import aiohttp
+import logging
 from aiohttp import ClientError
+from random import randint
 
-async def fetch(session, url, timeout_sec=5):
-    try:
-        async with session.get(url, timeout=timeout_sec) as response:
-            response.raise_for_status()
-            data = await response.text()
-            print(f"Fetched {len(data)} chars from {url}")
-            return url, data[:100]  # Return the first 100 characters for brevity
-    except ClientError as e:
-        print(f"Client error fetching {url}: {e}")
-        return url, None
-    except asyncio.TimeoutError:
-        print(f"Timeout error fetching {url}")
-        return url, None
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+
+class RateLimiter:
+    def __init__(self, rate, interval):
+        self._semaphore = asyncio.Semaphore(rate)
+        self._interval = interval
+
+    async def __aenter__(self):
+        await self._semaphore.acquire()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await asyncio.sleep(self._interval)
+        self._semaphore.release()
+
+async def fetch_with_retry(session, url, retries=2, timeout_sec=4):
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, timeout=timeout_sec) as resp:
+                resp.raise_for_status()
+                data = await resp.text()
+                logging.info(f"Success: {url} [{len(data)} bytes]")
+                return url, data
+        except (ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"Attempt {attempt+1} failed for {url}: {e}")
+            await asyncio.sleep(randint(1,3))  # Exponential backoff can also be used
+        except Exception as e:
+            logging.error(f"Unexpected error for {url}: {e}")
+            break
+    return url, None
+
+async def producer(urls, queue):
+    for url in urls:
+        await queue.put(url)
+    await queue.put(None)  # Sentinel for the consumer
+
+async def consumer(queue, session, limiter, results):
+    while True:
+        url = await queue.get()
+        if url is None:
+            await queue.put(None)  # propagate the sentinel to other consumers
+            break
+        async with limiter:
+            result = await fetch_with_retry(session, url)
+            results.append(result)
+
+async def write_results(results, filename="output.txt"):
+    loop = asyncio.get_event_loop()
+    data = []
+    for url, content in results:
+        snippet = content[:100].replace("\n", " ") if content else "FAILED"
+        data.append(f"{url}: {snippet}\n")
+    await loop.run_in_executor(None, lambda: open(filename, "w").writelines(data))
+    logging.info(f"Saved results to {filename}")
 
 async def main():
     urls = [
         'https://www.example.com',
         'https://www.python.org',
-        'https://httpbin.org/delay/3',  # Will deliberately delay
-        'https://nonexistent.domain',   # Will raise exception
-    ]
+        'https://httpbin.org/delay/3',
+        'https://nonexistent.domain'
+    ] * 2  # Duplicate to mimic more load
+
+    queue = asyncio.Queue()
+    results = []
+
+    limiter = RateLimiter(rate=2, interval=1.5)  # 2 requests per 1.5 seconds
+
     async with aiohttp.ClientSession() as session:
-        tasks = [asyncio.create_task(fetch(session, url, timeout_sec=2)) for url in urls]
-        for coro in asyncio.as_completed(tasks):
-            url, content = await coro
-            if content:
-                print(f"Processed content from {url}: {content[:60]!r}...")
-            else:
-                print(f"No content from {url}")
+        prod_task = asyncio.create_task(producer(urls, queue))
+        cons_tasks = [asyncio.create_task(consumer(queue, session, limiter, results)) for _ in range(3)]
+        await prod_task
+        await asyncio.gather(*cons_tasks)
+
+    await write_results(results)
 
 if __name__ == "__main__":
     asyncio.run(main())
