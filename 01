@@ -1,1 +1,19 @@
-ABCDE
+import asyncio
+
+async def do_work(task_id, delay):
+    print(f"Task {task_id} started, will take {delay}s")
+    await asyncio.sleep(delay)
+    print(f"Task {task_id} finished after {delay}s")
+    return f"Result {task_id}"
+
+async def main():
+    tasks = [
+        asyncio.create_task(do_work(1, 2)),
+        asyncio.create_task(do_work(2, 1)),
+        asyncio.create_task(do_work(3, 3)),
+    ]
+    results = await asyncio.gather(*tasks)
+    print("All tasks completed:", results)
+
+if __name__ == "__main__":
+    asyncio.run(main())
